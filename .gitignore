@@ -1,5 +1,6 @@
 # Configuration files with sensitive information
 COGNITO_SETUP.md
+PRESIGNED_URL_IMPLEMENTATION.md
 
 
 # # Local development files

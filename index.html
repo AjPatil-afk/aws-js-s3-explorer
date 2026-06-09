@@ -95,10 +95,6 @@ permissions and limitations under the License.
                         </div>
                     <!-- Controls -->
                         <div id="navbuttons" class="pull-right">
-                            <!-- Authentication Status -->
-                            <div id="auth-status" class="btn-group pull-left" style="margin-right: 10px;">
-                                <span id="auth-indicator" class="label label-warning">Authenticating...</span>
-                            </div>
                             <div>
                                 <!-- Hide folders checkbox -->
                                 <div class="btn-group">
@@ -178,21 +174,15 @@ permissions and limitations under the License.
     // CloudFront Support
     var HIDE_S3_ID = true;
     
-    // Cognito Configuration - 
-    var cognitoConfig = {
-        IdentityPoolId: 'us-east-1:1d8c5ee9-7745-44a7-9bce-8f8c5d0b202b', // Identity Pool ID
-        Region: 'us-east-1' 
-    };
-    
+    // Configuration for S3 bucket access via CloudFront
     var s3exp_config = {
-        Region: '',
+        Region: 'us-east-1',
         Bucket: '',
         CloudFront: '',
         Prefix: '',
         Delimiter: '/'
     };
     var s3exp_lister = null;
-    var isAuthenticated = false;
     var s3exp_columns = {
         key: 1,
         folder: 2,
@@ -200,21 +190,12 @@ permissions and limitations under the License.
         size: 4
     };
 
-    AWS.config.region = cognitoConfig.Region;
-
-    // Configure Cognito credentials
-    AWS.config.credentials = new AWS.CognitoIdentityCredentials({
-        IdentityPoolId: cognitoConfig.IdentityPoolId
-    });
-
-    // Initialize S3 SDK and the moment library (for time formatting utilities)
-    var s3 = new AWS.S3();
-    moment().format();
-
-    // CloudFront Support - Init CF SDK
-    var cloudfront = new AWS.CloudFront();
+    // API Gateway configuration (replaces AWS SDK with secure pre-signed URLs)
+    var apiConfig = {
+        apiUrl: 'https://8c8hf3fkkf.execute-api.us-east-1.amazonaws.com/Prod/s3'
+    };
     
-    // Note: initializeCognito() will be called in document.ready section
+    moment().format();
 
     function bytesToSize(bytes) {
         var sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
@@ -407,66 +388,68 @@ permissions and limitations under the License.
 
     function s3list(config, completecb) {
         console.log('s3list config: ' + JSON.stringify(config));
-        var params = {
-            Bucket: config.Bucket,
-            Prefix: config.Prefix,
-            Delimiter: config.Delimiter
-        };
+        
         var scope = {
             Contents: [],
             CommonPrefixes: [],
-            params: params,
+            params: {
+                Bucket: config.Bucket,
+                Prefix: config.Prefix,
+                Delimiter: config.Delimiter
+            },
             stop: false,
             completecb: completecb
         };
 
         return {
-            // This is the callback that the S3 API makes when an S3 listObjectsV2
-            // request completes (successfully or in error). Note that a single call
-            // to listObjectsV2 may not be enough to get all objects so we need to
-            // check if the returned data is truncated and, if so, make additional
-            // requests with a 'next marker' until we have all the objects.
-            cb: function(err, data) {
-                if (err) {
-                    console.log('Error: ' + JSON.stringify(err));
-                    console.log('Error: ' + err.stack);
-                    
-                    // If AccessDenied, try refreshing credentials and retry once
-                    if (err.code === 'AccessDenied' && !scope.retried) {
-                        console.log('AccessDenied error - refreshing credentials and retrying...');
-                        scope.retried = true;
-                        $('#bucket-loader').removeClass('fa-spin');
-                        
-                        AWS.config.credentials.refresh(function(refreshErr) {
-                            if (refreshErr) {
-                                console.log('Error refreshing credentials after AccessDenied:', refreshErr);
-                                bootbox.alert({message: 'Access denied. Unable to refresh credentials: ' + refreshErr.message});
-                                return;
-                            }
-                            console.log('Credentials refreshed, retrying S3 request...');
-                            // Retry the request with fresh credentials
-                            $('#bucket-loader').addClass('fa-spin');
-                            s3.listObjectsV2(scope.params, scope.cb);
-                        });
-                        return;
+            // Fetch data from API Gateway (replaces AWS SDK listObjectsV2)
+            cb: async function() {
+                if (scope.stop) {
+                    return;
+                }
+
+                try {
+                    // Build API request parameters
+                    const params = new URLSearchParams({
+                        action: 'list',
+                        prefix: scope.params.Prefix || '',
+                        delimiter: scope.params.Delimiter || '/'
+                    });
+
+                    if (scope.params.ContinuationToken) {
+                        params.append('marker', scope.params.ContinuationToken);
                     }
-                    
-                    scope.stop = true;
-                    $('#bucket-loader').removeClass('fa-spin');
-                    bootbox.alert({message: translations['bucketError'][currentLang] + scope.params.Bucket +'. Error: ' + err,});
-                } else {
-                    // console.log('Data: ' + JSON.stringify(data));
+
+                    // Call API Gateway
+                    const response = await fetch(`${apiConfig.apiUrl}?${params}`);
+                    const apiData = await response.json();
+
+                    if (!apiData.success) {
+                        throw new Error(apiData.error || 'Failed to list objects');
+                    }
+
+                    // Transform API response to match AWS SDK format
+                    var data = {
+                        Contents: apiData.contents.filter(item => item.Type === 'file').map(item => ({
+                            Key: item.Key,
+                            Size: item.Size,
+                            LastModified: item.LastModified ? new Date(item.LastModified) : null
+                        })),
+                        CommonPrefixes: apiData.contents.filter(item => item.Type === 'folder').map(item => ({
+                            Prefix: item.Key
+                        })),
+                        IsTruncated: apiData.isTruncated || false,
+                        NextContinuationToken: apiData.nextMarker
+                    };
+
                     console.log("Options: " + $("input[name='optionsdepth']:checked").val());
 
-                    // Store marker before filtering data
-                    if (data.IsTruncated) {
-                        if (data.NextContinuationToken) {
-                            scope.params.ContinuationToken = data.NextContinuationToken;
-                        }
+                    // Store marker for pagination
+                    if (data.IsTruncated && data.NextContinuationToken) {
+                        scope.params.ContinuationToken = data.NextContinuationToken;
                     }
 
                     // Filter the folders out of the listed S3 objects
-                    // (could probably be done more efficiently)
                     console.log("Filter: remove folders");
                     data.Contents = data.Contents.filter(function(el) {
                         return el.Key !== scope.params.Prefix;
@@ -498,8 +481,8 @@ permissions and limitations under the License.
                     if (scope.stop) {
                         console.log('Bucket ' + scope.params.Bucket + ' stopped');
                     } else if (data.IsTruncated) {
-                        console.log('Bucket ' + scope.params.Bucket + ' truncated');
-                        s3.listObjectsV2(scope.params, scope.cb);
+                        console.log('Bucket ' + scope.params.Bucket + ' truncated, fetching more...');
+                        await this.cb(); // Recursive call for pagination
                     } else {
                         console.log('Bucket ' + scope.params.Bucket + ' has ' + scope.Contents.length + ' objects, including ' + scope.CommonPrefixes.length + ' prefixes');
                         delete scope.params.ContinuationToken;
@@ -508,40 +491,22 @@ permissions and limitations under the License.
                         }
                         $('#bucket-loader').removeClass('fa-spin');
                     }
+
+                } catch (error) {
+                    console.log('Error: ' + error.message);
+                    scope.stop = true;
+                    $('#bucket-loader').removeClass('fa-spin');
+                    bootbox.alert({
+                        message: translations['bucketError'][currentLang] + scope.params.Bucket + '. Error: ' + error.message
+                    });
                 }
             },
 
-            // Start the spinner, clear the table, make an S3 listObjectsV2 request
+            // Start the spinner, clear the table, make an API request
             go: function() {
-                scope.cb = this.cb;
                 $('#bucket-loader').addClass('fa-spin');
                 $('#tb-s3objects').DataTable().clear();
-                
-                // Check if credentials exist and are not expired
-                var needsRefresh = !AWS.config.credentials || 
-                                  !AWS.config.credentials.accessKeyId ||
-                                  !AWS.config.credentials.expireTime ||
-                                  AWS.config.credentials.needsRefresh();
-                
-                if (needsRefresh) {
-                    console.log('Credentials missing or expired, refreshing...');
-                    AWS.config.credentials.refresh(function(err) {
-                        if (err) {
-                            console.log('Error refreshing credentials:', err);
-                            bootbox.alert({message: 'Authentication failed: ' + err.message + '. Please refresh the page and try again.'});
-                            $('#bucket-loader').removeClass('fa-spin');
-                            return;
-                        }
-                        console.log('Credentials refreshed successfully');
-                        console.log('New expiration time:', AWS.config.credentials.expireTime);
-                        isAuthenticated = true;
-                        s3.listObjectsV2(scope.params, scope.cb);
-                    });
-                } else {
-                    console.log('Using existing valid credentials for S3 call');
-                    console.log('Credentials expire at:', AWS.config.credentials.expireTime);
-                    s3.listObjectsV2(scope.params, scope.cb);
-                }
+                this.cb();
             },
 
             stop: function() {
@@ -704,73 +669,8 @@ permissions and limitations under the License.
             }, ]
         });
 
-        // Initialize Cognito and authentication
-        function initializeCognito() {
-            
-            // Clear any existing credentials
-            AWS.config.credentials = new AWS.CognitoIdentityCredentials({
-                IdentityPoolId: cognitoConfig.IdentityPoolId
-            });
-            
-            // Get temporary credentials
-            AWS.config.credentials.get(function(err) {
-                if (err) {
-                    console.log('Error getting credentials:', err);
-                    console.log('Error details:', JSON.stringify(err, null, 2));
-                    showAuthenticationUI();
-                    showAuthenticationError();
-                    isAuthenticated = false;
-                    return;
-                }
-                
-                console.log('Cognito credentials obtained successfully');
-                console.log('Access Key ID:', AWS.config.credentials.accessKeyId);
-                console.log('Identity ID:', AWS.config.credentials.identityId);
-                
-                isAuthenticated = true;
-                hideAuthenticationUI();
-                
-                // Set region if it wasn't already configured
-                if (!AWS.config.region) {
-                    AWS.config.region = cognitoConfig.Region;
-                }
-                
-                // Reinitialize S3 with new credentials
-                s3 = new AWS.S3();
-                console.log('S3 client reinitialized with Cognito credentials');
-            });
-        }
-
-        // Show authentication UI
-        function showAuthenticationUI() {
-            var authHtml = '<div id="auth-panel" class="alert alert-warning">' +
-                          '<h4>Authentication Required</h4>' +
-                          '<p>This application requires AWS Cognito authentication to access private S3 resources.</p>' +
-                          '<button id="auth-retry" class="btn btn-primary">Retry Authentication</button>' +
-                          '</div>';
-            $('#page-wrapper').prepend(authHtml);
-            
-            $('#auth-retry').click(function() {
-                initializeCognito();
-            });
-        }
-
-        // Hide authentication UI
-        function hideAuthenticationUI() {
-            $('#auth-panel').remove();
-            $('#auth-indicator').removeClass('label-warning label-danger').addClass('label-success').text('Authenticated');
-        }
-
-        // Show authentication error
-        function showAuthenticationError() {
-            $('#auth-indicator').removeClass('label-warning label-success').addClass('label-danger').text('Authentication Failed');
-        }
-
         $('#tb-s3objects').DataTable().column(s3exp_columns.key).visible(false);
         console.log("jQuery version=" + $.fn.jquery);
-
-        // Initialize Cognito authentication now that all functions are defined
-        initializeCognito();
 
         // Custom sort for the Key column so that folders appear before objects
         $.fn.dataTableExt.oSort['key-asc'] = function(a, b) {
@@ -807,54 +707,41 @@ permissions and limitations under the License.
                 s3exp_config.Prefix = target.dataset.prefix;
                 s3exp_config.Delimiter = $("input[name='optionsdepth']:checked").val() == "folder" ? "/" : "";
                 (s3exp_lister = s3list(s3exp_config, s3draw)).go();
-                // Else user has clicked on an object so download it with a pre-signed URL
+                // Else user has clicked on an object - generate pre-signed URL (for private bucket)
             } else if (target.dataset.s3 === "object") {
                 var key = target.dataset.key;
                 console.log("Generating pre-signed URL for: " + key);
                 
-                // Check if credentials are valid before generating pre-signed URL
-                var needsRefresh = !AWS.config.credentials || 
-                                  !AWS.config.credentials.accessKeyId ||
-                                  !AWS.config.credentials.expireTime ||
-                                  AWS.config.credentials.needsRefresh();
-                
-                if (needsRefresh) {
-                    console.log('Credentials expired, refreshing before download...');
-                    AWS.config.credentials.refresh(function(err) {
-                        if (err) {
-                            console.log('Error refreshing credentials for download:', err);
-                            bootbox.alert({message: 'Unable to download file. Authentication failed: ' + err.message});
-                            return;
+                // Call API Gateway to generate pre-signed URL
+                (async function() {
+                    try {
+                        const params = new URLSearchParams({
+                            action: 'get',
+                            key: key
+                        });
+
+                        const response = await fetch(`${apiConfig.apiUrl}?${params}`);
+                        const data = await response.json();
+
+                        if (!data.success) {
+                            throw new Error(data.error || 'Failed to generate download URL');
                         }
-                        console.log('Credentials refreshed, generating pre-signed URL...');
-                        generateAndDownload(key, target);
-                    });
-                } else {
-                    generateAndDownload(key, target);
-                }
+
+                        console.log('Pre-signed URL generated, expires in: ' + data.expiresIn + ' seconds');
+                        
+                        // Open the pre-signed URL for download
+                        window.open(data.url, '_blank', 'noopener,noreferrer');
+                        
+                    } catch (error) {
+                        console.error('Error downloading file:', error);
+                        bootbox.alert({
+                            message: translations['bucketError'][currentLang] + ': ' + error.message
+                        });
+                    }
+                })();
             }
             return false;
         });
-        
-        // Function to generate pre-signed URL and trigger download
-        function generateAndDownload(key, target) {
-            try {
-                var params = {
-                    Bucket: s3exp_config.Bucket,
-                    Key: key,
-                    Expires: 300 // URL valid for 5 minutes
-                };
-                
-                var url = s3.getSignedUrl('getObject', params);
-                console.log('Pre-signed URL generated successfully');
-                
-                // Open the pre-signed URL in a new tab/window
-                window.open(url, '_blank', 'noopener,noreferrer');
-            } catch (err) {
-                console.log('Error generating pre-signed URL:', err);
-                bootbox.alert({message: 'Unable to download file: ' + err.message});
-            }
-        }
 
         // Document URL typically looks like this for path-style URLs:
         // - https://s3.amazonaws.com/mybucket1/index.html
